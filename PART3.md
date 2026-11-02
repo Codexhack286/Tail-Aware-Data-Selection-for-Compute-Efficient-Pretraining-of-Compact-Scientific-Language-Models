@@ -136,7 +136,7 @@ device `NVIDIA GeForce RTX 5050 Laptop GPU`, compute capability (12, 0).
 Run one short pilot before the ten-run schedule:
 
 ```bash
-uv run --group train python src/train.py --subset random --seed 42 --max-steps 200 --out-dir runs/pilot/random_seed42
+uv run --group train python src/train.py --subset random --seed 42 --max-steps 200 --out-dir runs/pilot/random_seed42 --eval-every 100
 ```
 
 Pilot results:
@@ -144,7 +144,7 @@ Pilot results:
 | Metric | Value |
 |---|---:|
 | Device / precision | CUDA (RTX 5050 Laptop) / bfloat16 |
-| End-to-end throughput | 55,626 tokens/s (200 steps, including validation) |
+| Training-segment throughput | 55,626 tokens/s (58.9 s; includes the step-100 and step-200 validation passes) |
 | Peak allocated VRAM | 4,703 MB |
 | 200-step training loss | 5.84 (last logged 10-step mean) |
 | 200-step validation loss | 5.8924 |
@@ -167,14 +167,22 @@ uv run --group train python src/train_all.py --seeds 42 43 --max-tokens 60000000
 
 `train_all.py`:
 
-- skips a subset/seed pair if `summary.json` already exists;
-- resumes a partial pair from `ckpt_last.pt`;
+- freezes every hyperparameter once at launch and passes it to each child, so
+  a mid-schedule edit to `config.py` cannot mix settings across runs;
+- skips a pair only if its `summary.json` is valid and covers the full token
+  budget;
+- resumes a partial pair from `ckpt_last.pt`, rejecting a resume whose
+  training settings differ from the checkpoint;
 - stops at the first failure instead of silently continuing;
 - writes `runs/schedule.json` with every command and its status.
 
 The runs are sequential and stream their logs to the terminal. At the pilot's
 measured throughput, all ten runs take roughly **2.5 to 3.5 hours** on the
 RTX 5050 Laptop. Keep the laptop plugged in and prevent sleep during training.
+
+If a run is interrupted, re-running the same command resumes it without
+changing the data order or the learning-rate schedule, and keeps cumulative
+wall time and peak-memory figures. `config_resume.json` records each resume.
 
 To run one subset manually:
 

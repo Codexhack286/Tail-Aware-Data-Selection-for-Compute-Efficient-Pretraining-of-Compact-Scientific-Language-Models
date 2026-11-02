@@ -16,14 +16,55 @@ import config
 
 SUBSETS = ("random", "quality", "diversity", "tail_aware", "tail_only")
 
+# Resolve every hyperparameter once, at schedule launch, and pass it to each
+# child. A mid-schedule edit to config.py or train.py defaults then cannot
+# silently mix different settings across the ten runs.
+TRAIN_SETTINGS = {
+    "--block-size": config.PART3_BLOCK_SIZE,
+    "--batch-size": config.PART3_BATCH_SIZE,
+    "--grad-accum": config.PART3_GRAD_ACCUM,
+    "--lr": config.PART3_LR,
+    "--min-lr-ratio": config.PART3_MIN_LR_RATIO,
+    "--warmup-frac": config.PART3_WARMUP_FRAC,
+    "--weight-decay": config.PART3_WEIGHT_DECAY,
+    "--grad-clip": config.PART3_GRAD_CLIP,
+    "--dropout": config.PART3_DROPOUT,
+    "--n-layer": config.PART3_N_LAYER,
+    "--n-head": config.PART3_N_HEAD,
+    "--n-embd": config.PART3_N_EMBD,
+    "--eval-every": config.PART3_EVAL_EVERY,
+    "--log-every": config.PART3_LOG_EVERY,
+    "--save-every": config.PART3_SAVE_EVERY,
+}
+
 
 def run_dir(subset: str, seed: int, runs_dir: Path | None = None) -> Path:
     root = Path(runs_dir) if runs_dir is not None else config.RUNS_DIR
     return root / subset / f"seed{seed}"
 
 
-def is_complete(out_dir: Path) -> bool:
-    return (Path(out_dir) / "summary.json").exists()
+def expected_tokens(
+    max_tokens: int, block_size: int, batch_size: int, grad_accum: int
+) -> int:
+    tokens_per_step = block_size * batch_size * grad_accum
+    return (max_tokens // tokens_per_step) * tokens_per_step
+
+
+def is_complete(out_dir: Path, minimum_tokens: int | None = None) -> bool:
+    summary_path = Path(out_dir) / "summary.json"
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(summary, dict) or "step" not in summary:
+        return False
+    try:
+        tokens_seen = int(summary["tokens_seen"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if minimum_tokens is not None and tokens_seen < minimum_tokens:
+        return False
+    return True
 
 
 def should_resume(out_dir: Path) -> bool:
@@ -38,6 +79,7 @@ def build_train_command(
     python: str | None = None,
     extra: tuple[str, ...] = (),
     out_dir: Path | None = None,
+    settings: dict[str, object] | None = None,
 ) -> list[str]:
     command = [
         python or sys.executable,
@@ -51,13 +93,18 @@ def build_train_command(
     ]
     if out_dir is not None:
         command.extend(["--out-dir", str(out_dir)])
+    if settings:
+        for flag, value in settings.items():
+            command.extend([flag, str(value)])
     command.extend(extra)
     return command
 
 
 def _write_schedule(path: Path, schedule: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(schedule, indent=2), encoding="utf-8")
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(schedule, indent=2), encoding="utf-8")
+    tmp.replace(path)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -74,13 +121,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> None:
     args = build_arg_parser().parse_args(argv)
-    runs_root = Path(args.runs_dir)
+    runs_root = Path(args.runs_dir).resolve()
+    required_tokens = expected_tokens(
+        args.max_tokens,
+        config.PART3_BLOCK_SIZE,
+        config.PART3_BATCH_SIZE,
+        config.PART3_GRAD_ACCUM,
+    )
     schedule = []
 
     for subset in args.subsets:
         for seed in args.seeds:
             out_dir = run_dir(subset, seed, runs_root)
-            if is_complete(out_dir) and not args.force:
+            if is_complete(out_dir, required_tokens) and not args.force:
                 status = "complete"
                 command = None
             else:
@@ -93,6 +146,7 @@ def main(argv: list[str] | None = None) -> None:
                     python=args.python,
                     extra=extra,
                     out_dir=out_dir,
+                    settings=TRAIN_SETTINGS,
                 )
             schedule.append(
                 {

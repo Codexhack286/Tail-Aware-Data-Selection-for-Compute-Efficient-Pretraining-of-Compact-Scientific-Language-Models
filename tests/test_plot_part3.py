@@ -40,6 +40,14 @@ def test_collect_and_summarize(tmp_path: Path):
     assert report["random"]["std_final_val_loss"] == 0.0
 
 
+def test_malformed_summary_is_not_fatal(tmp_path: Path):
+    run = make_run(tmp_path)
+    (run / "summary.json").write_text("{", encoding="utf-8")
+    runs = collect_runs(tmp_path)
+    assert runs[0]["summary"] == {}
+    assert summarize(runs) == {}
+
+
 def test_write_report_creates_json(tmp_path: Path):
     make_run(tmp_path)
     runs = collect_runs(tmp_path)

@@ -211,8 +211,28 @@ def atomic_torch_save(payload: dict, path: Path) -> None:
     os.replace(tmp, path)
 
 
+def atomic_write_text(text: str, path: Path) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def load_checkpoint(path: Path) -> dict:
+    """Load a checkpoint on CPU so RNG byte tensors stay CPU tensors.
+
+    ``map_location=device`` would move the saved RNG state to CUDA and make
+    ``torch.set_rng_state`` fail on resume. Model and optimizer state are
+    copied onto the model's device by their own load_state_dict calls.
+    """
+    return torch.load(path, map_location="cpu", weights_only=False)
+
+
 def truncate_metrics(path: Path, max_step: int) -> None:
-    """Drop metric rows logged after the checkpoint that will be replayed."""
+    """Drop metric rows logged after the checkpoint that will be replayed.
+
+    A process killed while appending can leave a partial final line; skip it
+    rather than making the resumed run fail to start.
+    """
     path = Path(path)
     if not path.exists():
         return
@@ -220,9 +240,33 @@ def truncate_metrics(path: Path, max_step: int) -> None:
     for line in path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
-        if int(json.loads(line)["step"]) <= max_step:
+        try:
+            step = int(json.loads(line)["step"])
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            continue
+        if step <= max_step:
             kept.append(line)
     path.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+
+
+_RESUME_IGNORED = {"resume", "dry_run", "out_dir", "max_steps"}
+
+
+def resume_mismatches(saved: dict, current: dict) -> list[str]:
+    """Return the training settings that differ from a checkpoint's run."""
+
+    def norm(value: Any) -> Any:
+        return str(value) if isinstance(value, Path) else value
+
+    mismatches = []
+    for key in sorted(set(saved) | set(current)):
+        if key in _RESUME_IGNORED:
+            continue
+        if norm(saved.get(key)) != norm(current.get(key)):
+            mismatches.append(
+                f"{key}: checkpoint={saved.get(key)!r} current={current.get(key)!r}"
+            )
+    return mismatches
 
 
 def _check_token_range(windows: TokenWindows, vocab_size: int, name: str) -> None:
@@ -253,6 +297,11 @@ def train(config_: TrainConfig) -> dict:
         raise FileNotFoundError(f"missing validation file: {val_path}")
 
     out_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = out_dir / "summary.json"
+    if not config_.resume:
+        # A leftover summary from an interrupted forced rerun would otherwise
+        # make train_all and the report treat this run as complete.
+        summary_path.unlink(missing_ok=True)
     logger = make_logger(out_dir, config_.resume)
     device = resolve_device(config_.device)
     amp_dtype = resolve_amp(device, config_.amp)
@@ -330,8 +379,9 @@ def train(config_: TrainConfig) -> dict:
             "gpu": torch.cuda.get_device_name(0) if device.type == "cuda" else None,
         },
     }
-    (out_dir / "config.json").write_text(
-        json.dumps(_jsonable(run_config), indent=2), encoding="utf-8"
+    config_name = "config_resume.json" if config_.resume else "config.json"
+    atomic_write_text(
+        json.dumps(_jsonable(run_config), indent=2), out_dir / config_name
     )
 
     if config_.dry_run:
@@ -376,20 +426,30 @@ def train(config_: TrainConfig) -> dict:
 
     start_step = 0
     elapsed_total = 0.0
+    previous_peak_mb = 0.0
     best_val = math.inf
     best_step = 0
     resume_path = out_dir / "ckpt_last.pt"
     if config_.resume:
         if not resume_path.exists():
             raise FileNotFoundError(f"cannot resume, missing {resume_path}")
-        checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
+        checkpoint = load_checkpoint(resume_path)
         if checkpoint["config"] != asdict(model_config):
             raise ValueError("checkpoint model config does not match the current run")
+        mismatches = resume_mismatches(
+            checkpoint.get("train_config", {}), asdict(config_)
+        )
+        if mismatches:
+            raise ValueError(
+                "resume settings differ from the checkpoint:\n  "
+                + "\n  ".join(mismatches)
+            )
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         scheduler.load_state_dict(checkpoint["scheduler"])
         start_step = int(checkpoint["step"])
         elapsed_total = float(checkpoint.get("elapsed_s", 0.0))
+        previous_peak_mb = float(checkpoint.get("peak_mem_mb", 0.0))
         best_val = float(checkpoint.get("best_val", math.inf))
         best_step = int(checkpoint.get("best_step", 0))
         train_stream.skip_steps(start_step)
@@ -398,11 +458,21 @@ def train(config_: TrainConfig) -> dict:
             torch.cuda.set_rng_state_all(checkpoint["cuda_rng_state"])
         logger.info("resumed from %s at step %d", resume_path, start_step)
 
+    if start_step > max_steps:
+        raise ValueError(
+            f"checkpoint step {start_step} exceeds the current max_steps {max_steps}"
+        )
+
     metrics_path = out_dir / "metrics.jsonl"
     if config_.resume:
         truncate_metrics(metrics_path, start_step)
     metrics_mode = "a" if config_.resume else "w"
     metrics_file = open(metrics_path, metrics_mode, encoding="utf-8")
+
+    def peak_memory_mb() -> float:
+        if device.type != "cuda":
+            return previous_peak_mb
+        return max(previous_peak_mb, torch.cuda.max_memory_allocated() / 1024**2)
 
     def write_metric(record: dict) -> None:
         metrics_file.write(json.dumps(_jsonable(record)) + "\n")
@@ -426,6 +496,7 @@ def train(config_: TrainConfig) -> dict:
                 ),
                 "val_loss": _finite_or_none(val_loss),
                 "elapsed_s": elapsed_total + (time.perf_counter() - wall_start),
+                "peak_mem_mb": peak_memory_mb(),
             },
             out_dir / "ckpt_last.pt",
         )
@@ -463,11 +534,7 @@ def train(config_: TrainConfig) -> dict:
                 "grad_norm": None,
                 "elapsed_s": 0.0,
                 "tokens_per_s": None,
-                "peak_mem_mb": (
-                    torch.cuda.max_memory_allocated() / 1024**2
-                    if device.type == "cuda"
-                    else 0.0
-                ),
+                "peak_mem_mb": peak_memory_mb(),
                 "val_loss": val_loss,
                 "val_ppl": _finite_or_none(math.exp(val_loss)),
                 "best_val": _finite_or_none(best_val),
@@ -482,6 +549,7 @@ def train(config_: TrainConfig) -> dict:
         )
 
     wall_start = time.perf_counter()
+    val_loss: float | None = None
     for step in range(start_step, max_steps):
         optimizer.zero_grad(set_to_none=True)
         loss_sum = 0.0
@@ -505,12 +573,8 @@ def train(config_: TrainConfig) -> dict:
         lr = scheduler.get_last_lr()[0]
         if device.type == "cuda":
             torch.cuda.synchronize()
-        elapsed = time.perf_counter() - wall_start
-        peak_mem = (
-            torch.cuda.max_memory_allocated() / 1024**2
-            if device.type == "cuda"
-            else 0.0
-        )
+        elapsed = elapsed_total + (time.perf_counter() - wall_start)
+        peak_mem = peak_memory_mb()
 
         log_due = completed % config_.log_every == 0 or completed == max_steps
         eval_due = completed % config_.eval_every == 0 or completed == max_steps
@@ -567,18 +631,19 @@ def train(config_: TrainConfig) -> dict:
         if completed % config_.save_every == 0 or completed == max_steps:
             save_last(completed, tokens_seen, val_loss)
 
-    wall_time = elapsed_total + (time.perf_counter() - wall_start)
-    final_val = evaluate(model, val_windows, config_.batch_size, device, amp_dtype)
+    # The last training step always evaluates, so reuse that value instead of
+    # running a second full validation pass over the same weights.
+    if val_loss is None:
+        final_val = evaluate(model, val_windows, config_.batch_size, device, amp_dtype)
+    else:
+        final_val = val_loss
     if final_val < best_val:
         best_val = final_val
         best_step = max_steps
         save_best(max_steps, max_steps * tokens_per_step, final_val)
     final_tokens = max_steps * tokens_per_step
-    peak_mem = (
-        torch.cuda.max_memory_allocated() / 1024**2
-        if device.type == "cuda"
-        else 0.0
-    )
+    wall_time = elapsed_total + (time.perf_counter() - wall_start)
+    peak_mem = peak_memory_mb()
 
     atomic_torch_save(
         {
@@ -612,9 +677,7 @@ def train(config_: TrainConfig) -> dict:
         "train_bin": str(train_path),
         "val_bin": str(val_path),
     }
-    (out_dir / "summary.json").write_text(
-        json.dumps(_jsonable(summary), indent=2), encoding="utf-8"
-    )
+    atomic_write_text(json.dumps(_jsonable(summary), indent=2), summary_path)
     metrics_file.close()
     logger.info(
         "finished: final_val_loss=%.4f final_val_ppl=%.2f best_val_loss=%.4f "

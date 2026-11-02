@@ -29,11 +29,14 @@ def collect_runs(runs_dir: str | Path) -> list[dict]:
             if line.strip()
         ]
         summary_path = run_path / "summary.json"
-        summary = (
-            json.loads(summary_path.read_text(encoding="utf-8"))
-            if summary_path.exists()
-            else {}
-        )
+        summary = {}
+        if summary_path.exists():
+            try:
+                loaded = json.loads(summary_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                loaded = {}
+            if isinstance(loaded, dict):
+                summary = loaded
         runs.append(
             {
                 "subset": subset,
@@ -68,7 +71,7 @@ def _std(values: list[float]) -> float | None:
 def summarize(runs: list[dict]) -> dict:
     grouped: dict[str, list[dict]] = {}
     for run in runs:
-        if run.get("summary"):
+        if run.get("summary") and run["summary"].get("final_val_loss") is not None:
             grouped.setdefault(run["subset"], []).append(run)
 
     report = {}
@@ -78,12 +81,14 @@ def summarize(runs: list[dict]) -> dict:
             continue
         finals = _values(group, "final_val_loss")
         ppls = _values(group, "final_val_ppl")
+        tokens = _values(group, "tokens_seen")
         throughputs = _values(group, "tokens_per_s")
         walls = _values(group, "wall_time_s")
         peaks = _values(group, "peak_mem_mb")
         report[subset] = {
             "runs": len(group),
             "seeds": sorted(run["seed"] for run in group),
+            "mean_tokens_seen": _mean(tokens),
             "mean_final_val_loss": _mean(finals),
             "std_final_val_loss": _std(finals),
             "mean_final_val_ppl": _mean(ppls),
