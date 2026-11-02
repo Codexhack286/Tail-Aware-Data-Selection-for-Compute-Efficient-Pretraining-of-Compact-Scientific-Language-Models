@@ -159,9 +159,15 @@ def build_scheduler(
     warmup_steps = max(1, int(warmup_frac * max_steps))
 
     def lr_lambda(step: int) -> float:
-        if step < warmup_steps:
-            return step / warmup_steps
-        progress = min(1.0, (step - warmup_steps) / max(1, max_steps - warmup_steps))
+        # LambdaLR calls this with step 0 at construction, before any optimizer
+        # update. Count completed updates as step + 1 so the first update does
+        # not run at learning rate zero.
+        current = step + 1
+        if current <= warmup_steps:
+            return current / warmup_steps
+        progress = min(
+            1.0, (current - warmup_steps) / max(1, max_steps - warmup_steps)
+        )
         cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
         return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
 

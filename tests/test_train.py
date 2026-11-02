@@ -6,9 +6,25 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-pytest.importorskip("torch")
+torch = pytest.importorskip("torch")
+
+from model import GPT, GPTConfig
+from train import build_scheduler
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def test_scheduler_starts_nonzero_and_ends_at_floor():
+    model = GPT(GPTConfig(vocab_size=64, block_size=8, n_layer=1, n_head=2, n_embd=16))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1.0)
+    scheduler = build_scheduler(
+        optimizer, max_steps=100, warmup_frac=0.02, min_lr_ratio=0.1
+    )
+    assert scheduler.get_last_lr()[0] > 0.0
+    for _ in range(100):
+        optimizer.step()
+        scheduler.step()
+    assert scheduler.get_last_lr()[0] == pytest.approx(0.1, rel=1e-6)
 
 
 def make_fake_data(root: Path):
