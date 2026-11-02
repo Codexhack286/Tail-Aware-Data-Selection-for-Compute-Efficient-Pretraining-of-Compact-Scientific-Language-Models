@@ -7,3 +7,6 @@ uv.lock
 *.bin
 logs/
 data/subsets/
+runs/
+*.pt
+unsloth_compiled_cache/
