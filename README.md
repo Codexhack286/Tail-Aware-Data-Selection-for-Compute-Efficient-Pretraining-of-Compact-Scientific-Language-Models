@@ -24,3 +24,20 @@ Run order (about 20 min on 4 CPU cores, no GPU needed):
 
 Committed Part 2 outputs: tokenizer/tokenizer.json, manifests/*.txt.gz
 (the document ids of every subset), reports/*.json, reports/figures/.
+
+Part 3: compact Transformer training. Details: PART3.md.
+
+Environment (separate train group, so the data environment stays light):
+  uv sync --group train
+
+Pilot (not part of the comparison):
+  uv run --group train python src/train.py --subset random --seed 42 \
+      --max-steps 200 --out-dir runs/pilot/random_seed42
+
+Full schedule (five subsets x two seeds, 60M tokens each):
+  uv run --group train python src/train_all.py --seeds 42 43 --max-tokens 60000000
+
+Aggregate results:
+  uv run --group train python src/plot_part3.py
+
+The test split is not read during Part 3. It is reserved for Part 4.

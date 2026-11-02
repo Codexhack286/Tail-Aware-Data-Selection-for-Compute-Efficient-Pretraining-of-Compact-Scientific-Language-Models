@@ -1,0 +1,267 @@
+# PART3.md: Compact Transformer Training
+
+**Project:** Tail-Aware Data Selection for Compute-Efficient Pretraining of Compact Scientific Language Models
+**Stage:** Part 3, model training (pipeline ready; pilot results below)
+**Input:** Part 2 token files in `data/subsets/`
+
+---
+
+## 1. What this stage trains
+
+The same compact decoder-only Transformer is trained on each of the five
+Part 2 subsets:
+
+| Subset | What it represents |
+|---|---|
+| `random` | Natural mix, no quality filter |
+| `quality` | Quality filter, natural mix |
+| `diversity` | Quality filter, balanced over text themes |
+| `tail_aware` | Quality filter, tail-aware over arXiv fields (proposed) |
+| `tail_only` | Tail-aware over fields, no quality filter (ablation) |
+
+Every run gets the same tokenizer, model, optimizer, schedule, batch size,
+context length, and token budget. Only `train.bin` changes.
+
+**Primary comparison:** two seeds (42 and 43) for each subset, ten runs total,
+60,000,000 training tokens per run. That is two passes over each 30M-token
+subset. The same number of optimizer steps is used everywhere.
+
+`test.bin` is never opened in Part 3. It is reserved for Part 4.
+
+---
+
+## 2. Inputs
+
+The committed Part 2 inputs are `tokenizer/tokenizer.json` and
+`manifests/*.txt.gz`. The tokenized `.bin` files are git-ignored and must exist
+locally:
+
+```
+data/subsets/
+  random/train.bin      30.0M uint16 tokens
+  quality/train.bin
+  diversity/train.bin
+  tail_aware/train.bin
+  tail_only/train.bin
+  val.bin                5.96M tokens, shared by every run
+  test.bin               6.07M tokens, Part 4 only
+  val_docs.parquet       per-document offsets and topic labels
+  test_docs.parquet
+  meta.json              vocab 16384, eot 0, pad 1
+```
+
+If those files are missing, rebuild them from the pinned source (about 25
+minutes):
+
+```bash
+uv run python src/build_raw.py
+uv run python src/clean_corpus.py
+uv run python src/split_corpus.py
+uv run python src/build_topics.py
+uv run python src/export_tokens.py
+```
+
+If the Kaggle `vroomvroom2006/processedryan` parquet files are already in
+`data/processed/`, skip the first three commands.
+
+---
+
+## 3. Model
+
+| Component | Value |
+|---|---|
+| Type | Decoder-only Transformer, pre-LayerNorm |
+| Parameters | **17.1M** |
+| Layers / heads / width | 6 / 6 / 384 |
+| Context length | 512 tokens |
+| Position encoding | Learned absolute embeddings |
+| Attention | Causal scaled dot-product attention (`is_causal=True`) |
+| MLP | GELU, 4x width |
+| Embeddings | Input and output embeddings tied |
+| Dropout | 0.0 |
+| Vocabulary | 16,384 (fixed Part 2 tokenizer) |
+
+Why this size: it is within the synopsis's 10-20M target, fits comfortably in
+8 GB of VRAM, and leaves enough capacity for data-selection differences to
+appear. A 17.1M model is intentionally small; this is a controlled data
+experiment, not a attempt to maximize absolute language-model quality.
+
+---
+
+## 4. Optimization
+
+| Setting | Value |
+|---|---|
+| Optimizer | AdamW |
+| Betas | (0.9, 0.95) |
+| Weight decay | 0.1, excluded from biases and LayerNorm |
+| Peak learning rate | 6e-4 |
+| Warmup | 2% of steps, linear |
+| Decay | Cosine to 10% of peak |
+| Batch size | 32 sequences x 512 tokens = 16,384 tokens/step |
+| Gradient accumulation | 1 |
+| Gradient clipping | 1.0 |
+| Precision | bf16 autocast on CUDA, fp32 on CPU |
+| Steps per run | 3,662 |
+| Tokens per run | 59,998,208 (60M budget) |
+| Seeds | 42, 43 |
+
+The small difference between 60,000,000 and 59,998,208 is the whole-step
+rounding; every subset has exactly the same number of steps.
+
+---
+
+## 5. Environment
+
+The project uses Python 3.14 and a separate `train` dependency group, so the
+Part 1/2 data environment does not need PyTorch:
+
+```bash
+uv sync --group train
+uv run --group train python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+```
+
+Expected: `2.14.1+cu130` and `True`. The training loop uses bf16 and PyTorch's
+flash SDPA backend on the RTX 5050 Laptop (8.5 GB, compute capability 12.0).
+No Unsloth dependency is used: Unsloth is a finetuning accelerator, while this
+is a from-scratch model.
+
+Measured on this machine: `torch 2.14.1+cu130`, CUDA 13.0, bf16 supported,
+device `NVIDIA GeForce RTX 5050 Laptop GPU`, compute capability (12, 0).
+
+---
+
+## 6. Pilot
+
+Run one short pilot before the ten-run schedule:
+
+```bash
+uv run --group train python src/train.py --subset random --seed 42 --max-steps 200 --out-dir runs/pilot/random_seed42
+```
+
+Pilot results:
+
+| Metric | Value |
+|---|---:|
+| Device / precision | CUDA (RTX 5050 Laptop) / bfloat16 |
+| End-to-end throughput | 55,626 tokens/s (200 steps, including validation) |
+| Peak allocated VRAM | 4,703 MB |
+| 200-step training loss | 5.84 (last logged 10-step mean) |
+| 200-step validation loss | 5.8924 |
+| 200-step validation perplexity | 362.26 |
+
+The pilot confirms that the default batch size 32 with gradient accumulation 1
+fits comfortably: peak memory is 4.7 GB of the 8.5 GB available. No gradient
+accumulation or model-width change is needed. The pilot is not part of the
+comparison and is stored under `runs/pilot/`.
+
+---
+
+## 7. Full run
+
+From the project root, in a terminal you can leave open:
+
+```bash
+uv run --group train python src/train_all.py --seeds 42 43 --max-tokens 60000000
+```
+
+`train_all.py`:
+
+- skips a subset/seed pair if `summary.json` already exists;
+- resumes a partial pair from `ckpt_last.pt`;
+- stops at the first failure instead of silently continuing;
+- writes `runs/schedule.json` with every command and its status.
+
+The runs are sequential and stream their logs to the terminal. At the pilot's
+measured throughput, all ten runs take roughly **2.5 to 3.5 hours** on the
+RTX 5050 Laptop. Keep the laptop plugged in and prevent sleep during training.
+
+To run one subset manually:
+
+```bash
+uv run --group train python src/train.py --subset tail_aware --seed 42
+```
+
+To resume an interrupted single run:
+
+```bash
+uv run --group train python src/train.py --subset tail_aware --seed 42 --resume
+```
+
+---
+
+## 8. Outputs
+
+Each run writes to `runs/<subset>/seed<seed>/`:
+
+```
+config.json       resolved model, data, optimizer, environment
+run.log           human-readable progress
+metrics.jsonl     step, tokens, train/val loss, perplexity, LR, grad norm,
+                  tokens/s, peak memory
+ckpt_last.pt      model + optimizer + scheduler, resumable
+ckpt_best.pt      best-validation model only
+model_last.pt     final model only (Part 4)
+summary.json      final/best validation loss, perplexity, runtime, throughput
+```
+
+`runs/` is git-ignored. Checkpoints are large; keep them locally for Part 4.
+
+After all runs, aggregate the comparison:
+
+```bash
+uv run --group train python src/plot_part3.py
+```
+
+That writes `reports/part3_report.json` and
+`reports/figures/part3_val_loss.png`.
+
+---
+
+## 9. How to read the result
+
+- The **primary number** is final validation loss at the fixed 60M-token budget,
+  not the best checkpoint. Early stopping at different points would make the
+  comparison unfair.
+- `best_val_loss` is reported for analysis, but it is not the primary metric.
+- Overall validation loss is dominated by head topics because the validation
+  set is about 75% head. `tail_aware` deliberately halves the head, so its
+  overall loss can look worse even if rare-topic loss improves. Part 4 must
+  report head / mid / tail perplexity separately.
+- `quality` and `random` share about 95% of their documents (Part 2). A small or
+  null difference between them is expected and is itself a finding about this
+  clean arXiv corpus.
+- Two seeds give a rough error bar, not a significance test. Do not describe a
+  difference smaller than the seed-to-seed spread as an effect.
+
+---
+
+## 10. Checklist
+
+- [x] Part 3 inputs rebuilt and verified (`meta.json`, token range, file sizes)
+- [x] `torch` CUDA environment verified
+- [x] All unit tests pass (`uv run --group train pytest -q`)
+- [x] Pilot completed and throughput/memory recorded
+- [ ] Ten full runs completed
+- [ ] `reports/part3_report.json` and validation-loss figure generated
+- [ ] Results section updated
+- [x] Test set still untouched
+
+Next: Part 4, held-out test evaluation, per-group perplexity, efficiency
+comparison, and generated-text analysis.
+
+---
+
+## 11. Results (fill after the full schedule)
+
+| Subset | Runs | Final val loss (mean ± sd) | Final val ppl | Tokens/s | Peak VRAM (MB) |
+|---|---:|---:|---:|---:|---:|
+| random | | | | | |
+| quality | | | | | |
+| diversity | | | | | |
+| tail_aware | | | | | |
+| tail_only | | | | | |
+
+Primary comparison: final validation loss at the fixed 60M-token budget.
+Two seeds give a rough spread; do not call a difference smaller than that
+spread an effect. Per-group (head / mid / tail) results belong in Part 4.
