@@ -9,9 +9,19 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from model import GPT, GPTConfig
-from train import build_scheduler
+from train import build_scheduler, truncate_metrics
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def test_truncate_metrics_removes_steps_after_checkpoint(tmp_path):
+    path = tmp_path / "metrics.jsonl"
+    path.write_text(
+        "\n".join(json.dumps({"step": step}) for step in (0, 10, 20, 30)) + "\n"
+    )
+    truncate_metrics(path, 10)
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [row["step"] for row in rows] == [0, 10]
 
 
 def test_scheduler_starts_nonzero_and_ends_at_floor():
@@ -40,10 +50,8 @@ def make_fake_data(root: Path):
     return data_dir
 
 
-def test_train_cli_writes_checkpoints_and_metrics(tmp_path):
-    data_dir = make_fake_data(tmp_path)
-    out_dir = tmp_path / "run"
-    cmd = [
+def tiny_cmd(data_dir: Path, out_dir: Path, *extra: str) -> list[str]:
+    return [
         sys.executable,
         "src/train.py",
         "--subset",
@@ -54,8 +62,6 @@ def test_train_cli_writes_checkpoints_and_metrics(tmp_path):
         str(data_dir),
         "--out-dir",
         str(out_dir),
-        "--max-steps",
-        "3",
         "--batch-size",
         "2",
         "--block-size",
@@ -75,7 +81,14 @@ def test_train_cli_writes_checkpoints_and_metrics(tmp_path):
         "1",
         "--save-every",
         "1",
+        *extra,
     ]
+
+
+def test_train_cli_writes_checkpoints_and_metrics(tmp_path):
+    data_dir = make_fake_data(tmp_path)
+    out_dir = tmp_path / "run"
+    cmd = tiny_cmd(data_dir, out_dir, "--max-steps", "3")
     result = subprocess.run(cmd, cwd=ROOT, text=True, capture_output=True)
     assert result.returncode == 0, result.stderr
     assert (out_dir / "ckpt_last.pt").exists()
@@ -85,3 +98,33 @@ def test_train_cli_writes_checkpoints_and_metrics(tmp_path):
     assert summary["step"] == 3
     assert summary["tokens_seen"] == 3 * 2 * 8
     assert summary["final_val_loss"] is not None
+
+
+def test_train_cli_resumes_without_duplicate_metrics(tmp_path):
+    data_dir = make_fake_data(tmp_path)
+    out_dir = tmp_path / "run"
+    first = subprocess.run(
+        tiny_cmd(data_dir, out_dir, "--max-steps", "2"),
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+    )
+    assert first.returncode == 0, first.stderr
+    metrics = out_dir / "metrics.jsonl"
+    with metrics.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"step": 99, "val_loss": 1.0}) + "\n")
+
+    resumed = subprocess.run(
+        tiny_cmd(data_dir, out_dir, "--max-steps", "3", "--resume"),
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+    )
+    assert resumed.returncode == 0, resumed.stderr
+    summary = json.loads((out_dir / "summary.json").read_text())
+    assert summary["step"] == 3
+    assert summary["tokens_seen"] == 3 * 2 * 8
+    rows = [json.loads(line) for line in metrics.read_text().splitlines()]
+    assert max(row["step"] for row in rows) == 3
+    assert sum(row["step"] == 0 for row in rows) == 1
+    assert summary["wall_time_s"] > 0

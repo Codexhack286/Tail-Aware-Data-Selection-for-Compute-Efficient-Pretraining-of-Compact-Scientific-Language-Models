@@ -211,6 +211,20 @@ def atomic_torch_save(payload: dict, path: Path) -> None:
     os.replace(tmp, path)
 
 
+def truncate_metrics(path: Path, max_step: int) -> None:
+    """Drop metric rows logged after the checkpoint that will be replayed."""
+    path = Path(path)
+    if not path.exists():
+        return
+    kept = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        if int(json.loads(line)["step"]) <= max_step:
+            kept.append(line)
+    path.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+
+
 def _check_token_range(windows: TokenWindows, vocab_size: int, name: str) -> None:
     maximum = int(windows.data.max())
     if maximum >= vocab_size:
@@ -361,6 +375,7 @@ def train(config_: TrainConfig) -> dict:
     )
 
     start_step = 0
+    elapsed_total = 0.0
     best_val = math.inf
     best_step = 0
     resume_path = out_dir / "ckpt_last.pt"
@@ -374,6 +389,7 @@ def train(config_: TrainConfig) -> dict:
         optimizer.load_state_dict(checkpoint["optimizer"])
         scheduler.load_state_dict(checkpoint["scheduler"])
         start_step = int(checkpoint["step"])
+        elapsed_total = float(checkpoint.get("elapsed_s", 0.0))
         best_val = float(checkpoint.get("best_val", math.inf))
         best_step = int(checkpoint.get("best_step", 0))
         train_stream.skip_steps(start_step)
@@ -383,6 +399,8 @@ def train(config_: TrainConfig) -> dict:
         logger.info("resumed from %s at step %d", resume_path, start_step)
 
     metrics_path = out_dir / "metrics.jsonl"
+    if config_.resume:
+        truncate_metrics(metrics_path, start_step)
     metrics_mode = "a" if config_.resume else "w"
     metrics_file = open(metrics_path, metrics_mode, encoding="utf-8")
 
@@ -407,6 +425,7 @@ def train(config_: TrainConfig) -> dict:
                     torch.cuda.get_rng_state_all() if device.type == "cuda" else None
                 ),
                 "val_loss": _finite_or_none(val_loss),
+                "elapsed_s": elapsed_total + (time.perf_counter() - wall_start),
             },
             out_dir / "ckpt_last.pt",
         )
@@ -426,32 +445,41 @@ def train(config_: TrainConfig) -> dict:
     logger.info("max_steps=%d planned_tokens=%d", max_steps, planned_tokens)
     logger.info("validation windows=%d", val_windows.n_windows)
 
-    # Evaluate the initial (or resumed) model so the learning curve starts at 0.
-    val_loss = evaluate(model, val_windows, config_.batch_size, device, amp_dtype)
-    if val_loss < best_val:
-        best_val = val_loss
-        best_step = start_step
-        save_best(start_step, start_step * tokens_per_step, val_loss)
-    write_metric(
-        {
-            "step": start_step,
-            "tokens": start_step * tokens_per_step,
-            "train_loss": None,
-            "lr": scheduler.get_last_lr()[0],
-            "grad_norm": None,
-            "elapsed_s": 0.0,
-            "tokens_per_s": None,
-            "peak_mem_mb": (
-                torch.cuda.max_memory_allocated() / 1024**2
-                if device.type == "cuda"
-                else 0.0
-            ),
-            "val_loss": val_loss,
-            "val_ppl": _finite_or_none(math.exp(val_loss)),
-            "best_val": _finite_or_none(best_val),
-        }
-    )
-    logger.info("step 0 val_loss=%.4f val_ppl=%.2f", val_loss, math.exp(val_loss))
+    # Evaluate the initial model so the learning curve starts at step 0. A
+    # resumed run keeps the rows already in metrics.jsonl instead of repeating
+    # this evaluation.
+    if start_step == 0:
+        val_loss = evaluate(model, val_windows, config_.batch_size, device, amp_dtype)
+        if val_loss < best_val:
+            best_val = val_loss
+            best_step = start_step
+            save_best(start_step, start_step * tokens_per_step, val_loss)
+        write_metric(
+            {
+                "step": start_step,
+                "tokens": start_step * tokens_per_step,
+                "train_loss": None,
+                "lr": scheduler.get_last_lr()[0],
+                "grad_norm": None,
+                "elapsed_s": 0.0,
+                "tokens_per_s": None,
+                "peak_mem_mb": (
+                    torch.cuda.max_memory_allocated() / 1024**2
+                    if device.type == "cuda"
+                    else 0.0
+                ),
+                "val_loss": val_loss,
+                "val_ppl": _finite_or_none(math.exp(val_loss)),
+                "best_val": _finite_or_none(best_val),
+            }
+        )
+        logger.info("step 0 val_loss=%.4f val_ppl=%.2f", val_loss, math.exp(val_loss))
+    else:
+        logger.info(
+            "resumed at step %d; step-0 validation not repeated (best_val=%.4f)",
+            start_step,
+            best_val,
+        )
 
     wall_start = time.perf_counter()
     for step in range(start_step, max_steps):
@@ -539,7 +567,7 @@ def train(config_: TrainConfig) -> dict:
         if completed % config_.save_every == 0 or completed == max_steps:
             save_last(completed, tokens_seen, val_loss)
 
-    wall_time = time.perf_counter() - wall_start
+    wall_time = elapsed_total + (time.perf_counter() - wall_start)
     final_val = evaluate(model, val_windows, config_.batch_size, device, amp_dtype)
     if final_val < best_val:
         best_val = final_val
