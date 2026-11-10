@@ -8,5 +8,9 @@ uv.lock
 logs/
 data/subsets/
 runs/
+runs_*/
 *.pt
 unsloth_compiled_cache/
+.pytest_cache/
+*.log
+*.tmp
