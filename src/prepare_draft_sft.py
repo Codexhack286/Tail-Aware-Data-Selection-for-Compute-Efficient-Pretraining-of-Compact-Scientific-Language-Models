@@ -11,18 +11,20 @@ def prompt(title, notes):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--output', type=Path, default=ROOT/'data'/'draft_sft_v1')
+    p.add_argument('--output', type=Path, default=ROOT/'data'/'draft_sft_v2')
     p.add_argument('--limit', type=int, default=20000)
     p.add_argument('--seed', type=int, default=42)
     args = p.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
     tok = Tokenizer.from_file(str(ROOT/'tokenizer'/'tokenizer.json'))
-    df = pd.read_parquet(ROOT/'data'/'processed'/'train.parquet', columns=['id','title','abstract'])
-    df = df.sort_values('id').sample(frac=1, random_state=args.seed).head(args.limit)
+    frames = {split: pd.read_parquet(ROOT/'data'/'processed'/f'{split}.parquet', columns=['id','title','abstract']).sort_values('id').sample(frac=1, random_state=args.seed).head(args.limit if split == 'train' else min(args.limit, 200)) for split in ('train', 'val')}
+    if set(frames['train'].id) & set(frames['val'].id):
+        raise ValueError('Paper IDs overlap across source splits')
     counts = {'train': 0, 'val': 0, 'too_long': 0, 'invalid': 0}
     files = {s: (args.output/f'{s}.jsonl').open('x', encoding='utf8') for s in ('train','val')}
     lengths = []
-    for row in df.itertuples(index=False):
+    for split, df in frames.items():
+      for row in df.itertuples(index=False):
         title, abstract = str(row.title).strip(), str(row.abstract).strip()
         sentences = re.split(r'(?<=[.!?])\s+', abstract)
         if not title or len(sentences) < 2:
@@ -31,13 +33,19 @@ def main():
         # This is a conservative reconstruction task, not natural notes.
         rng = random.Random(int(hashlib.sha256((str(args.seed)+str(row.id)).encode()).hexdigest(),16))
         rng.shuffle(sentences)
-        prefix = prompt(title, ' '.join(sentences))
+        # Synthetic notes preserve every sentence, including numbers and negation.
+        # Lexical cues are limited to discourse openings to avoid deleting facts.
+        notes = [re.sub(r'^(?:In this paper,? |In this work,? |Here,? )', '', sentence, flags=re.I) for sentence in sentences]
+        working_title = title if rng.random() < .5 else ''
+        if not working_title:
+            # Supply title concepts explicitly so the target title remains supported.
+            notes.append('Title concepts: ' + title)
+        prefix = prompt(working_title, '\n- ' + '\n- '.join(notes))
         target = f' {title}\nAbstract: {abstract}'
         a, b = tok.encode(prefix).ids, tok.encode(target).ids
         if len(a)+len(b)+1 > 512:
             counts['too_long'] += 1; continue
-        split = 'val' if int(hashlib.sha256(str(row.id).encode()).hexdigest(),16)%20 == 0 else 'train'
-        files[split].write(json.dumps({'id':str(row.id),'prompt':prefix,'target':target},ensure_ascii=False)+'\n')
+        files[split].write(json.dumps({'id':str(row.id),'prompt':prefix,'target':target, 'source_split':split, 'synthetic':True},ensure_ascii=False)+'\n')
         counts[split] += 1; lengths.append(len(a)+len(b)+1)
     for f in files.values(): f.close()
     counts['max_tokens'] = max(lengths, default=0)

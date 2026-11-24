@@ -277,7 +277,7 @@ def _check_token_range(windows: TokenWindows, vocab_size: int, name: str) -> Non
         )
 
 
-def train(config_: TrainConfig) -> dict:
+def train(config_: TrainConfig, *, model_factory=None, model_metadata=None) -> dict:
     if config_.max_tokens < 1:
         raise ValueError("max_tokens must be positive")
     if config_.max_steps is not None and config_.max_steps < 1:
@@ -345,20 +345,25 @@ def train(config_: TrainConfig) -> dict:
         config_.block_size * config_.batch_size * config_.grad_accum
     )
     planned_tokens = max_steps * tokens_per_step
-    model_config = GPTConfig(
-        vocab_size=vocab_size,
-        block_size=config_.block_size,
-        n_layer=config_.n_layer,
-        n_head=config_.n_head,
-        n_embd=config_.n_embd,
-        dropout=config_.dropout,
-    )
+    if model_factory is None:
+        model_config = GPTConfig(
+            vocab_size=vocab_size,
+            block_size=config_.block_size,
+            n_layer=config_.n_layer,
+            n_head=config_.n_head,
+            n_embd=config_.n_embd,
+            dropout=config_.dropout,
+        )
+        model_metadata = asdict(model_config)
+        model_factory = lambda: GPT(model_config)
+    elif model_metadata is None:
+        raise ValueError("custom models require checkpoint metadata")
     run_config = {
         "subset": config_.subset,
         "seed": config_.seed,
         "device": str(device),
         "amp_dtype": amp_label(amp_dtype),
-        "model": asdict(model_config),
+        "model": model_metadata,
         "train": asdict(config_),
         "data": {
             "train_bin": str(train_path),
@@ -411,7 +416,7 @@ def train(config_: TrainConfig) -> dict:
         config_.subset,
         config_.seed,
     )
-    model = GPT(model_config).to(device)
+    model = model_factory().to(device)
     logger.info(
         "model %.2fM params | steps=%d | tokens/step=%d | planned=%.2fM",
         model.num_parameters() / 1e6,
@@ -434,7 +439,7 @@ def train(config_: TrainConfig) -> dict:
         if not resume_path.exists():
             raise FileNotFoundError(f"cannot resume, missing {resume_path}")
         checkpoint = load_checkpoint(resume_path)
-        if checkpoint["config"] != asdict(model_config):
+        if checkpoint["config"] != model_metadata:
             raise ValueError("checkpoint model config does not match the current run")
         mismatches = resume_mismatches(
             checkpoint.get("train_config", {}), asdict(config_)
@@ -488,7 +493,7 @@ def train(config_: TrainConfig) -> dict:
                 "tokens_seen": tokens,
                 "best_val": best_val,
                 "best_step": best_step,
-                "config": asdict(model_config),
+                "config": model_metadata,
                 "train_config": asdict(config_),
                 "torch_rng_state": torch.get_rng_state(),
                 "cuda_rng_state": (
@@ -505,7 +510,7 @@ def train(config_: TrainConfig) -> dict:
         atomic_torch_save(
             {
                 "model": model.state_dict(),
-                "config": asdict(model_config),
+                "config": model_metadata,
                 "step": step,
                 "tokens_seen": tokens,
                 "val_loss": val_loss,
@@ -648,7 +653,7 @@ def train(config_: TrainConfig) -> dict:
     atomic_torch_save(
         {
             "model": model.state_dict(),
-            "config": asdict(model_config),
+            "config": model_metadata,
             "step": max_steps,
             "tokens_seen": final_tokens,
             "val_loss": final_val,

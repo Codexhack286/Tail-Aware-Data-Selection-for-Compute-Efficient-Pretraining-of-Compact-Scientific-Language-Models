@@ -1,7 +1,7 @@
 # PART3.md: Compact Transformer Training
 
 **Project:** Tail-Aware Data Selection for Compute-Efficient Pretraining of Compact Scientific Language Models
-**Stage:** Part 3, model training (pipeline ready; pilot results below)
+**Stage:** Part 3, completed model training and validation
 **Input:** Part 2 token files in `data/subsets/`
 
 ---
@@ -22,9 +22,9 @@ Part 2 subsets:
 Every run gets the same tokenizer, model, optimizer, schedule, batch size,
 context length, and token budget. Only `train.bin` changes.
 
-**Primary comparison:** two seeds (42 and 43) for each subset, ten runs total,
-60,000,000 training tokens per run. That is two passes over each 30M-token
-subset. The same number of optimizer steps is used everywhere.
+**Completed comparison:** five seeds (42–46) for each subset, 25 runs total.
+Each run uses a 60M-token budget, approximately two passes over its 30M-token
+subset. All paired runs use the same number of optimizer steps.
 
 `test.bin` is never opened in Part 3. It is reserved for Part 4.
 
@@ -67,6 +67,9 @@ If the Kaggle `vroomvroom2006/processedryan` parquet files are already in
 ---
 
 ## 3. Model
+
+See the [Transformer architecture](docs/transformer_architecture.md) for the
+implemented model, the 17M and 34M configurations, and continuation behavior.
 
 | Component | Value |
 |---|---|
@@ -162,7 +165,7 @@ comparison and is stored under `runs/pilot/`.
 From the project root, in a terminal you can leave open:
 
 ```bash
-uv run --group train python src/train_all.py --seeds 42 43 --max-tokens 60000000
+uv run --group train python src/train_all.py --seeds 42 43 44 45 46 --max-tokens 60000000
 ```
 
 `train_all.py`:
@@ -176,9 +179,9 @@ uv run --group train python src/train_all.py --seeds 42 43 --max-tokens 60000000
 - stops at the first failure instead of silently continuing;
 - writes `runs/schedule.json` with every command and its status.
 
-The runs are sequential and stream their logs to the terminal. At the pilot's
-measured throughput, all ten runs take roughly **2.5 to 3.5 hours** on the
-RTX 5050 Laptop. Keep the laptop plugged in and prevent sleep during training.
+The runs are sequential and stream their logs to the terminal. The completed
+25-run campaign logged approximately five hours of training and evaluation
+on the RTX 5050 Laptop GPU.
 
 If a run is interrupted, re-running the same command resumes it without
 changing the data order or the learning-rate schedule, and keeps cumulative
@@ -239,37 +242,23 @@ That writes `reports/part3_report.json` and
 - `quality` and `random` share about 95% of their documents (Part 2). A small or
   null difference between them is expected and is itself a finding about this
   clean arXiv corpus.
-- Two seeds give a rough error bar, not a significance test. Do not describe a
-  difference smaller than the seed-to-seed spread as an effect.
+- The five-seed review reports paired differences and variation across seeds.
 
 ---
 
-## 10. Checklist
+## 10. Completed results
 
-- [x] Part 3 inputs rebuilt and verified (`meta.json`, token range, file sizes)
-- [x] `torch` CUDA environment verified
-- [x] All unit tests pass (`uv run --group train pytest -q`)
-- [x] Pilot completed and throughput/memory recorded
-- [ ] Ten full runs completed
-- [ ] `reports/part3_report.json` and validation-loss figure generated
-- [ ] Results section updated
-- [x] Test set still untouched
+The original two-seed analysis was extended to five seeds (42–46) per strategy.
+Each of the 25 runs processed 59,998,208 training tokens at the same model
+size. The [five-seed review](reports/five_seed_results_review.md) contains the
+paired analysis, and the [strategy summary](reports/5seed_strategy_summary.csv)
+contains the measured values.
 
-Next: Part 4, held-out test evaluation, per-group perplexity, efficiency
-comparison, and generated-text analysis.
+Tail-aware selection lowered mean tail loss from 3.9477 to 3.8571 relative to
+random selection. Mean overall loss rose from 3.6514 to 3.6677. The tail benefit
+and overall cost appeared in all five paired seeds. These are validation
+results.
 
----
-
-## 11. Results (fill after the full schedule)
-
-| Subset | Runs | Final val loss (mean ± sd) | Final val ppl | Tokens/s | Peak VRAM (MB) |
-|---|---:|---:|---:|---:|---:|
-| random | | | | | |
-| quality | | | | | |
-| diversity | | | | | |
-| tail_aware | | | | | |
-| tail_only | | | | | |
-
-Primary comparison: final validation loss at the fixed 60M-token budget.
-Two seeds give a rough spread; do not call a difference smaller than that
-spread an effect. Per-group (head / mid / tail) results belong in Part 4.
+The [architecture document](docs/transformer_architecture.md) also covers the
+34M random-only baseline. The [drafting and transfer guide](docs/phase1_drafting_application.md)
+includes the matched SmolLM2 comparison and downstream drafting evaluation.

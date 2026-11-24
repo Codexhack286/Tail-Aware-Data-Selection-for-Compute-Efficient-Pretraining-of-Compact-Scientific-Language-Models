@@ -1,7 +1,0 @@
-﻿# Drafting pilot preparation
-
-`python src/prepare_draft_sft.py --limit 2000 --output data/draft_sft_v1` sampled the existing training split with seed 42. It assigns paper IDs deterministically to train or validation before deriving examples; the original held-out test split is not read. The local run yielded 1,031 train, 58 validation, 907 context-length exclusions and 4 invalid records. Mean sequence length was 405.17 tokens; maximum was 512. Output directories must not already exist.
-
-The prompt contains the original title and every abstract sentence in shuffled order. This avoids deliberately omitting facts required by the target, but it is an artificial reconstruction task, provides the answer title, and substantially overstates the information in real research notes. It cannot establish ability to invent a grounded title from notes or handle missing results. Sentence splitting is heuristic, and near-duplicate papers across IDs or splits may still leak. The length filter favors shorter texts. The train/validation division is a development split within the original training pool, not the held-out test set. Derived records should not be redistributed without reviewing original licenses.
-
-`src/train_draft_sft.py` is an unvalidated pilot implementation: it masks prompt tokens in the loss and writes a separate checkpoint, but it has not been run or benchmarked. Do not interpret its output as evidence of factual fidelity. Evaluation against carefully authored notes, including absent and reversed findings, remains necessary.

@@ -427,7 +427,6 @@ Greedy decoding is far more repetitive than temperature sampling (`tok3rep` 0.37
 - `audit_training.py` — config identity, loss curves, gradient norms, seed pairing, report consistency.
 - `probe_eot.py` — EOT probability/recall/false-positive probe.
 - `eval_by_group.py` — token-level per-group validation loss.
-- `inspect_results.py` — extracts concrete examples from the JSON.
 
 All 49 repository tests still pass (`uv run --group train pytest -q`).
 
